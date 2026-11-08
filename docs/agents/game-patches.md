@@ -68,6 +68,8 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | `build` → `game` | 60 fps frame step: the KIDS frame task and frame-rate block | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Hyrule Warriors: Age of Calamity](../../dm/games/01002B00111A2000/README.md) | the game's own frame code; only the host's frame-step state page is shared. Fire Emblem: Three Houses and Taiko Risshiden V DX run on KTGL too, with other frame code |
 | `build` → `game` | frame step floor 2 → 1 vsync, and its frame step | frame rate | blocked: frame-step stubs have no function-matched form yet | judgement | 1 | [Paper Mario: The Thousand-Year Door](../../dm/games/0100ECD018EBE000/README.md) | the game's own clock floor and step |
 | `build` → `game` | screen shape: the sizes, the view, the layouts' projection and their edge widgets (DM_SCREEN_ASPECT) | rendering | blocked: the stubs have no function-matched form yet | judgement | 1 | [Animal Crossing: New Horizons](../../dm/games/01006F8002326000/README.md) | the output size is the host's, but where the game takes its sizes, its cameras and its layouts are this build's code |
+| `build` → `game` | VRR frame-rate steps 60 / 48 / 40 instead of 2 fps | frame rate | kept: only the Mac with a ProMotion screen wants these steps; a host switch that writes the object ([+0x20], [+0x28]) at run time would make it the player's choice | checked: v458752 main: the controller disassembled and its object read while running (DM_PROBE main:204640, DM_CTL peek), 2026-11-03 | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | the steps a screen that shows frames on 1/240 s steps can hold evenly; a function fingerprint (MATCH_CUTS) could carry it over the game's updates |
+| `build` → `game` | VRR rate up only after 120 frames in a row that allow it | frame rate | kept: the wait trades frames for calm (4 to 7 fps less in a heavy cave); a host switch that writes the wait at run time would make it the player's choice | checked: v458752 main: the patched controller's bytes run on the Mac against a model of it, 0 frames apart on a recorded session's input (145 rate changes → 24), 2026-11-03 | 1 | [Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md) | a rate that changes about once a second jolts the picture more than a lower rate held; a function fingerprint (MATCH_CUTS) could carry it over the game's updates |
 
 ## Summary
 
@@ -77,6 +79,7 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 | [ASTRAL CHAIN](#astral-chain) | 0 | 0 | 112 | 0 | 0 | `build` → `game` |
 | [Batman: Arkham Knight](#batman-arkham-knight) | 8 | 0 | 0 | 0 | 1 | `build` → `game` ×2 |
 | [DARK SOULS: REMASTERED](#dark-souls-remastered) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
+| [Donkey Kong Bananza](#donkey-kong-bananza) | 14 | 0 | 0 | 0 | 0 | `build` → `game` ×2 |
 | [EA SPORTS FC 27](#ea-sports-fc-27) | 0 | 0 | 0 | 0 | 1 | `build` → `engine` |
 | [FINAL FANTASY CRYSTAL CHRONICLES Remastered Edition](#final-fantasy-crystal-chronicles-remastered-edition) | 8 | 0 | 0 | 0 | 0 | `build` → `engine` |
 | [FINAL FANTASY TACTICS - The Ivalice Chronicles](#final-fantasy-tactics---the-ivalice-chronicles) | 2 | 0 | 0 | 0 | 0 | `build` → `game` |
@@ -282,6 +285,29 @@ Every patch bound tighter than it could be: the open gaps, then the blocked, kep
 - **1.0.3 `main`** `df3766a2…` ([patches.py:10](../../dm/games/01004AB00A260000/patches.py#L10))
   - cut `+0x706fa4`: frame limiter target: mov w1,#30 → mov w1,#60 (main+0x707090 sleeps out 1000 / fps ms since the last frame)
   - cut `+0x667904`: frame update step: ldr s8,[x8,#0x6ec] (1/30) → ldr s8,[x8,#0x834] (1/60), passed to main+0x6a337c
+
+### Donkey Kong Bananza
+
+[Donkey Kong Bananza](../../dm/games/040074A01BF12000/README.md), `040074A01BF12000`, [patches.py](../../dm/games/040074A01BF12000/patches.py).
+
+- **`build` → `game`**, frame rate, kept: only the Mac with a ProMotion screen wants these steps; a host switch that writes the object ([+0x20], [+0x28]) at run time would make it the player's choice, checked: v458752 main: the controller disassembled and its object read while running (DM_PROBE main:204640, DM_CTL peek), 2026-11-03: VRR frame-rate steps 60 / 48 / 40 instead of 2 fps. The steps a screen that shows frames on 1/240 s steps can hold evenly; a function fingerprint (MATCH_CUTS) could carry it over the game's updates
+- **`build` → `game`**, frame rate, kept: the wait trades frames for calm (4 to 7 fps less in a heavy cave); a host switch that writes the wait at run time would make it the player's choice, checked: v458752 main: the patched controller's bytes run on the Mac against a model of it, 0 frames apart on a recorded session's input (145 rate changes → 24), 2026-11-03: VRR rate up only after 120 frames in a row that allow it. A rate that changes about once a second jolts the picture more than a lower rate held; a function fingerprint (MATCH_CUTS) could carry it over the game's updates
+
+- **v458752 `main`** `e25c90c1…` ([patches.py:16](../../dm/games/040074A01BF12000/patches.py#L16))
+  - cut `+0x204700`: VRR up wait: subs w9, w12, #1 → ldr w9, [x19, #0x54] (next rate up)
+  - cut `+0x204704`: VRR up wait: b.lt (wait already 0) → sub w10, w12, #1
+  - cut `+0x204708`: VRR up wait: ldr w10, [x19, #0x54] → mov w13, #120
+  - cut `+0x20470c`: VRR up wait: cmp w11, w10 → cmp w11, w9 (does this frame allow the next rate?)
+  - cut `+0x204710`: VRR up wait: b.lt (no: keep the wait) → csel w10, w10, w13, ge (yes: wait - 1, no: 120 again)
+  - cut `+0x204714`: VRR up wait: str w9, [x19, #0x4c] → str w10, [x19, #0x4c]
+  - cut `+0x204724`: VRR rate down: ldr w14, [x19, #0x28] (step) → mov w12, #48
+  - cut `+0x204728`: VRR rate down: sub w12, w11, w13 → mov w1, #40
+  - cut `+0x20472c`: VRR rate down: sdiv w12, w12, w14 → cmp w11, w12 (does the frame allow 48?)
+  - cut `+0x204730`: VRR rate down: madd w1, w12, w14, w13 (min + whole steps) → csel w1, w12, w1, ge (48, else 40)
+  - cut `+0x204734`: VRR rate down: add w12, w1, w14 (next step up) → csel w12, w9, w12, ge (60 from 48, 48 from 40)
+  - cut `+0x2047b0`: VRR up wait after going up: ldr w10, [x19, #0x1c] (6) → mov w10, #120
+  - cut `+0x2047c0`: VRR rate up: ldr w10, [x19, #0x28] (step) → mov w10, #12 (48 → 60)
+  - cut `+0x2047dc`: VRR up wait after going down: ldr w14, [x19, #0x1c] (6) → mov w14, #120
 
 ### EA SPORTS FC 27
 
