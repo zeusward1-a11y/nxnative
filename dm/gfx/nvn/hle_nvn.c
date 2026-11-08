@@ -384,11 +384,8 @@ typedef struct { const uint8_t *mem; uint64_t size; tex_t t; uint64_t stamp; con
 static flush_tex *g_ft; static size_t g_nft, g_cft; static pthread_mutex_t g_ft_mu = PTHREAD_MUTEX_INITIALIZER;
 static void ft_add(const tex_t *t) {
     // Buffer textures are views onto the pool buffer the GPU reads directly (tex_mtl in nvn_mtl.m); an upload would push Age of Calamity's 1,048,576-texel R32F one through tex_desc, past Metal's 2D limit
-    // COMPRESSIBLE is a memory-compression hint, not a data format: a game that sets it on every texture it creates (SD GUNDAM G GENERATION CROSS RAYS,
-    // SDK 9.4.1) still writes plain texels, so those textures must be registered too or the CPU writes that follow stay invisible (its tutorial overlay's
-    // background never appeared). A CPU_NO_ACCESS pool keeps the exclusion: there the compression tags may really be there.
     if (!DM_GAME_TEX_FLUSH_UPLOAD || !t->mem || !t->pool || t->has_layout || t->d.target == NVN_TEXTURE_TARGET_BUFFER || (t->pool->flags & NVN_MEMORY_POOL_FLAGS_CPU_NO_ACCESS) ||
-        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))) return;
+        (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET | NVN_TEXTURE_FLAGS_COMPRESSIBLE))) return;
     pthread_mutex_lock(&g_ft_mu);
     if (g_nft == g_cft && !(g_ft = realloc(g_ft, (g_cft = g_cft ? 2 * g_cft : 1024) * sizeof *g_ft))) die("flush_tex allocation failed");
     uint64_t st = nvn_dirty_now(); if (DM_GAME_TEX_DIRTY_UPLOAD) nvn_dirty_protect(t->mem, t->L.size);   // see nvn_ft_written
@@ -746,13 +743,15 @@ NVN(nvnCommandBufferSaveZCullData, void, NVNcommandBuffer *c, NVNbufferAddress a
 // The stencil test ZCull's stencil cull assumes (a stencil function, then its reference and mask): only a hint for culling ahead of the real stencil test, which the draws'
 // depth-stencil state still does. The host does no ZCull, so there is nothing to set (Donkey Kong Bananza: EQUAL, 0xff)
 NVN_NOPROTO(nvnCommandBufferSetStencilCullCriteria, void, NVNcommandBuffer *c, int func, int ref) { (void)c; (void)func; (void)ref; }
-static _Atomic uint64_t g_sync_ns;
+static _Atomic uint64_t g_sync_ns, g_sync_acq_ns, g_sync_new_ns;   // the frame's blocked SyncWait time; of it, on acquire syncs; on a fence that was the newest when waited for
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
     int (*w)(uint64_t, uint64_t) = o->fenced == 2 ? mtl_wait_acq : mtl_wait;
     if (w(o->fence, 0)) return NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED;
-    uint64_t t0 = now_ns(); int ok = w(o->fence, timeout); atomic_fetch_add(&g_sync_ns, now_ns() - t0);   // the frame's blocked SyncWait time (@sync_ms)
+    uint64_t t0 = now_ns(); int newest = o->fence >= mtl_last_fence(), ok = w(o->fence, timeout); uint64_t d = now_ns() - t0;
+    atomic_fetch_add(&g_sync_ns, d);   // the frame's blocked SyncWait time (@sync_ms)
+    if (o->fenced == 2) atomic_fetch_add(&g_sync_acq_ns, d); else if (newest) atomic_fetch_add(&g_sync_new_ns, d);   // @sync_acq_ms, @sync_new_ms: which wait keeps the CPU from running ahead of the GPU
     return ok ? NVN_SYNC_WAIT_RESULT_CONDITION_SATISFIED : NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 }
 NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
@@ -1401,6 +1400,24 @@ static uint64_t present_period(const win_t *o);
 static uint64_t rt_period_ns(const win_t *o, uint64_t period);
 static int present_itv(const win_t *o);
 static int link_wait(const win_t *o, uint64_t timeout_ns);
+// VRR (DM_VI_VRR, hle_vi.c): while the game holds the display's VRR capability on with an extended swap interval set, that interval is the frame period in place of NVN's swap interval.
+// Donkey Kong Bananza's frame-rate controller sets 1 / 40 to 1 / 60 seconds by its load and keeps NVN's interval at 2: held to 30 fps it gave up on VRR within a few seconds
+__attribute__((weak)) uint64_t dm_vi_vrr_period_ns(void);   // hle_vi.c (nvn_mtl.m has a weak stand-in for graphics unit tests; neither may be linked)
+__attribute__((weak)) int mtl_vrr_fps(void);   // nvn_mtl.m: DM_VI_VRR_FPS
+__attribute__((weak)) uint32_t mtl_ndsr_in(void);   // nvn_mtl.m: the last NDSR input size (w << 16 | h)
+__attribute__((weak)) int mtl_ts_frame(uint64_t f, double *raw_ms, double *span_ms, double *cut_ms);   // nvn_mtl.m: the frame's timestamp report ledger
+static uint64_t vrr_period_ns(void) {
+    uint64_t p = dm_detclock_enabled() || !dm_vi_vrr_period_ns ? 0 : dm_vi_vrr_period_ns(); int f = p && mtl_vrr_fps ? mtl_vrr_fps() : 0;
+    return f ? 1000000000ull / (uint64_t)f : p;
+}
+// The acquire's wait: frame starts a period apart on a steady clock. A frame late by under a period keeps the clock's phase (the next one may start at once); later than that, the clock starts again
+static void vrr_pace(uint64_t period) {
+    static uint64_t next, period_was;   // acquire thread only
+    uint64_t t = now_ns();
+    if (period != period_was) { period_was = period; next = 0; static int n; if (n++ < 40) LOG("[nvn] VRR: frame period %.2f ms (%.1f fps)", period / 1e6, 1e9 / period); }
+    if (next > t && next - t <= period) { sleep_until_ns(next); t = next; }
+    next = next && t >= next && t - next < period ? next + period : t + period;
+}
 __attribute__((weak)) void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = 0; *ns = 0; }   // The host's hle_thread.c provides the ground truth; 0 in graphics unit tests
 __attribute__((weak)) uint32_t dm_guest_work_qos(unsigned *count) { if (count) *count = 0; return QOS_CLASS_UNSPECIFIED; }
 int mtl_probe_ramp_on(void);   // nvn_mtl.m: DM_FSTEP_PROBE_RAMP (default on; ab with DM_AB)
@@ -1423,8 +1440,9 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o), rtp = rt_period_ns(o, period);
         if (rtp && rt_period != rtp) { rt_period = rtp; set_time_constraint(rtp); }
         rt_comp_tick(rtp);
-        uint64_t p0 = now_ns(); int snap = mtl_snap_on();
-        if (snap && mtl_link_active() && mtl_link_stalled()) { if (wait) sleep_until_ns(at); }   // present snapshots (nvn_mtl.m) while the display link is silent (the window in the background or covered):
+        uint64_t p0 = now_ns(); int snap = mtl_snap_on(), vrr = vrr_period_ns() != 0;
+        if (vrr) vrr_pace(vrr_period_ns());   // VRR: the game's extended swap interval (hle_vi.c), on the host's clock; the display link shows each frame on its next refresh
+        else if (snap && mtl_link_active() && mtl_link_stalled()) { if (wait) sleep_until_ns(at); }   // present snapshots (nvn_mtl.m) while the display link is silent (the window in the background or covered):
             // frames are dropped as fast as they come and nothing frees a ring slot later, so the texture's slot time paces the game: unpaced, Breath of the Wild ran 3 to 4.5 times real time there.
             // Otherwise snapshots take the display link's wait below like any present. The wait for a free ring slot (mtl_snap_acquire_wait) alone did not pace: the link takes frames in
             // order and drops all but the newest two, and a dropped frame frees its slot, so Donkey Kong Bananza at the 30 fps cap ran 43-65 fps of game time and dropped about 110 of every 300 frames
@@ -1442,7 +1460,7 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     // The previous present of this texture has not yet been processed by the present thread (display cannot keep up, a whole swapchain round behind): wait for it to be returned, then hand it to the game to draw
     uint64_t tk = *idx < 4 ? o->ticket[*idx] : 0;
     if (tk) { uint64_t w0 = now_ns(); mtl_present_wait(tk); g_pq_wait_ns += now_ns() - w0; }
-    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point have completed (fenced 2: an acquire sync, for the wait ledger)
+    if (s) { ((sync_t *)s)->fenced = 2; ((sync_t *)s)->fence = *idx < 4 && mtl_acq_sync_present() ? o->pfence[*idx] : mtl_last_fence(); }   // The swapchain texture becomes available once the commits before this point (DM_NVN_ACQ_SYNC=present: before its previous present) have completed (fenced 2: an acquire sync, for the wait ledger)
     if (!g_fs_start) { g_fs_start = now_ns(); g_fs_wait = pace_ns; }   // the frame starts when the first acquire after a present returns: on a display-link tick when on time
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
 }
@@ -1492,6 +1510,7 @@ counts_done:
 #define TWIN 300
 static double g_tw[6][TWIN]; static unsigned g_tn[6];
 static double g_pres_iv[TWIN]; static unsigned g_presn;   // Present interval (ms; -1 = dropped by the system, 0 = no reading)
+static nvn_tk_ring g_tk;   // the ticket each present took in the present queue, by window and present number: the screen times 8 presents back are read by it (nvn_pace.h nvn_tk_put)
 static double g_pres_exp[TWIN], g_pres_exp_last;   // how long that frame should have stayed on screen (ms, pres_expect_ms); the last one for slow_emit
 // The hold (60 Hz vsyncs) each present was given, by present number. On-screen intervals are read 8 presents late, so each is judged against the holds of its own presents:
 // with the frame step at 2 vsyncs every frame stays 33.3 ms, which is not a dropped frame
@@ -1589,10 +1608,13 @@ static void tsummary(uint64_t frame) {
       if (n) { memcpy(v, g_tw[0], n * sizeof *v); qsort(v, n, sizeof *v, dcmp); for (unsigned i = 0; i < n; i++) over += v[i] > tgt;
         LOG("[nvn] frame interval up to frame %llu: >%.1fms %u / %u frames, p99 %.2f ms", frame, tgt, over, n, v[(n * 99) / 100 < n ? (n * 99) / 100 : n - 1]); } }
     { unsigned n = g_presn < TWIN ? g_presn : TWIN, k = 0, drop = 0, discard = 0; double v[TWIN];   // on-screen present: dropped frame = on screen longer than its hold × 1.5 (pres_expect_ms) or discarded
-      for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > g_pres_exp[i] * 1.5; } }
+      // 0.1 ms over: on-screen times come in refresh steps, and three refreshes of a 120 Hz screen (25.0002 ms) are a hold of 1.5 at 60 fps, not a dropped frame
+      for (unsigned i = 0; i < n; i++) { double x = g_pres_iv[i]; if (x < 0) { drop++; discard++; } else if (x > 0) { v[k++] = x; drop += x > g_pres_exp[i] * 1.5 + 0.1; } }
       task_vm_info_data_t vi; mach_msg_type_number_t vc = TASK_VM_INFO_COUNT; double fp = task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &vc) == KERN_SUCCESS ? vi.phys_footprint / 1048576.0 : -1;
       double br = dm_brightness_now();   // footprint / brightness are carried on the on-screen present row: does not depend on the tick-entry observation gate (camp runs have it too)
       if (k) { qsort(v, k, sizeof *v, dcmp); LOG("[nvn] on-screen up to frame %llu: %u frames, dropped %u (discarded %u), p99 %.2f ms; footprint %.0f MiB; brightness %.2f; thermal %d", frame, k + discard, drop, discard, v[(k * 99) / 100 < k ? (k * 99) / 100 : k - 1], fp, br, dm_thermal_now()); }
+      // VRR: how evenly the frames reach the screen (the spread of the on-screen interval, and its mean change from one frame to the next: 0 is perfectly even, 8.3 is 16.7 / 25 ms in turn)
+      if (k > 1 && vrr_period_ns()) LOG("[nvn] on-screen spread up to frame %llu: p10 %.2f / p50 %.2f / p90 %.2f ms, mean change between consecutive frames %.2f ms", frame, v[k / 10], v[k / 2], v[(k * 9) / 10], nvn_pace_jitter(g_pres_iv, n));
       g_presn = 0; }
     power_line(frame);
     { static uint64_t prev[6], pf; uint64_t v[6]; mtl_vbuf_stats(&v[0], &v[1], &v[2], &v[3], &v[4], &v[5]);
@@ -1767,7 +1789,7 @@ static nvn_fstep g_fs;   // present thread only
 static nvn_fgpu g_fg;   // the GPU time at kmin and at the current hold (nvn_fstep_gpu_slowed)
 static _Atomic int g_fs_k;   // the hold presentation follows (0 = not decided yet)
 // The display link runs at 30 Hz at a 30 cap, except while the game fixes its own step at 1 (BotW's VFR override)
-int nvn_game_fps(void) { int c = fps_present_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() >= s + 1000000000ull ? 30 : 60; }
+int nvn_game_fps(void) { int c = fps_present_cap(); if (c) return c == 30 && atomic_load(&g_fs_k) == 1 && fstep_on() ? 60 : c; if (vrr_period_ns()) return 60; uint64_t s = atomic_load(&g_itv2_since); return g_hz > 0 && !g_display_mode && s && now_ns() >= s + 1000000000ull ? 30 : 60; }
 static void present_cfg(const win_t *o) {
     if (g_hz >= 0) return;
     // The interval mode comes from the game profile (present_interval, default game): whether frames follow the present interval the game sets depends on whether the game's logic counts frames, which differs per game. Environment variables override it, and can override the fixed 60 Hz.
@@ -1806,6 +1828,7 @@ static uint64_t present_period(const win_t *o) {
         if (want < 2 || want % 2) atomic_store(&g_itv2_since, 0);   // an odd interval needs the 60 Hz link: 3 vsyncs on a 30 Hz link were 2 ticks, 15 fps for 20
         else if (was < 2 || was % 2) atomic_store(&g_itv2_since, now_ns() | 1);   // | 1: the start is never 0
     }
+    uint64_t vp = vrr_period_ns(); if (vp) return vp;
     int itv = present_itv(o), hz = g_hz;
     return hz > 0 ? (uint64_t)itv * 1000000000ull / (uint64_t)hz : 0;
 }
@@ -1869,7 +1892,7 @@ static void fstep_tick(const win_t *o, int c) {
     // A game that is slower than its hold frame after frame (not a few long frames: 12 of the last 16 started late) is late too, though the screen misses only every few frames:
     // 18.9 ms frames at hold 1 missed one refresh in 7, never three in a row, and ran at a jittering 53 fps with a payback every few frames instead of a steady 30
     if (mtl_snap_on() && mtl_link_active() && !mtl_link_stalled() && o->presents > 9) {   // (frames the stall fallback drops say nothing about the game: judged by cost then)
-        uint64_t pn = o->presents - 8; double a = mtl_presented_time(pn), b = mtl_presented_time(pn - 1);
+        uint64_t pn = o->presents - 8, n = nvn_tk_get(&g_tk, o, pn), np = nvn_tk_get(&g_tk, o, pn - 1); double a = n ? mtl_presented_time(n) : 0, b = n && np ? mtl_presented_time(np) : 0;   // by ticket (nvn_tk_put)
         if (a < 0) g_fs.screen = 2; else if (a > 0 && b > 0) g_fs.screen = (a - b) * 1e3 > 1.25 * pres_expect_ms(pn) ? 2 : 1;
         static uint16_t slow_bits; static int slow_k; int k = g_fs.k ? g_fs.k : kmin;
         if (k != slow_k) { slow_k = k; slow_bits = 0; }   // judged against the hold in force, not the frames before a step
@@ -1951,8 +1974,9 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (idx >= 0 && idx < o->ntex && idx < 4) {   // enqueue only, return immediately
         const tex_t *t = CTX(o->tex[idx]); int lc[4]; const int *crop = present_crop(o->crop, (int)t->d.width, (int)t->d.height, lc);
         nvn_cap_present(t, crop);   // DM_NVN_CAPTURE (nvn_capture.inc)
-        o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop);
+        o->ticket[idx] = mtl_present(t, present_period(o) / 1e9, crop); o->pfence[idx] = mtl_last_fence();
     }
+    nvn_tk_put(&g_tk, o, o->presents, idx >= 0 && idx < o->ntex && idx < 4 ? mtl_present_queued() : 0);   // its screen times are read by this ticket 8 presents on
     gfx_leave();
     atomic_fetch_add(&g_nvn_ns, now_ns() - t0);
     uint64_t f = g_frame, ps, dr; mtl_stats(&ps, &dr);
@@ -1974,7 +1998,8 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (prev_in) {
         double fr = (t0 - prev_in) / 1e6, wk = (t0 - prev_out) / 1e6, nv = atomic_exchange(&g_nvn_ns, 0) / 1e6;
         tpush(0, fr); tpush(1, wk); tpush(2, nv);
-        trow(f, "@frame_ms", fr); trow(f, "@work_ms", wk); trow(f, "@nvn_ms", nv); trow(f, "@sync_ms", atomic_exchange(&g_sync_ns, 0) / 1e6); trow(f, "@itv", (double)present_itv(o));
+        trow(f, "@frame_ms", fr); trow(f, "@work_ms", wk); trow(f, "@nvn_ms", nv); trow(f, "@sync_ms", atomic_exchange(&g_sync_ns, 0) / 1e6); trow(f, "@sync_acq_ms", atomic_exchange(&g_sync_acq_ns, 0) / 1e6); trow(f, "@sync_new_ms", atomic_exchange(&g_sync_new_ns, 0) / 1e6); trow(f, "@itv", (double)present_itv(o));
+        trow(f, "@vrr_ms", vrr_period_ns() / 1e6);   // the frame period the game asked for with VRR on (0 without): a game that steps its time by it runs at Σ @vrr_ms / Σ @frame_ms of its speed
         // Slow-frame attribution (taken only when DM_NVN_TSV is on): this frame's present-thread CPU time (−1 if the thread changed), CPU of all threads in the process, acquire wait accumulated per frame, present call time (same base as the GPU / on-screen present times: ms since process start)
         trow(f, "@wait_ms", g_acq_wait_ns / 1e6); trow(f, "@pq_wait_ms", g_pq_wait_ns / 1e6);
         if (frame_rec()) {
@@ -2029,7 +2054,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
                        (unsigned long long)r->f, r->t_s, r->fr, r->nv, g, r->pso, r->lib, r->make_ms, r->up, r->rup, r->up_mb, r->up_ms, r->hy);
               // Visibility: during the time a long frame "comes out late", what stays on screen is the previous frame; if the previous frame was a loading screen (or this frame itself is one), all the player sees is the loading screen staying a bit longer, with no motion interrupted
               dm_longframe_note(b); } }
-        uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); } }
+        uint64_t g0, g1; if (frame_rec() && mtl_gpu_span(f - 8, &g0, &g1)) { trow(f - 8, "@gpu_beg_ms", (g0 - g_t0_ns) / 1e6); trow(f - 8, "@gpu_end_ms", (g1 - g_t0_ns) / 1e6); }
+        // the frame's timestamp reports (8 frames late, once all its GPU work completed): first to last by segment time, as written (DM_NVN_GPU_TS=busy), idle removed
+        double tr, ts, tc; if (frame_rec() && g >= 0 && mtl_ts_frame && mtl_ts_frame(f - 8, &tr, &ts, &tc)) { trow(f - 8, "@ts_raw_ms", tr); trow(f - 8, "@ts_span_ms", ts); trow(f - 8, "@ts_cut_ms", tc); }
+        if (frame_rec() && mtl_ndsr_in) { uint32_t ni = mtl_ndsr_in(); trow(f, "@ndsr_w", ni >> 16); trow(f, "@ndsr_h", ni & 0xffff); } }   // the game's dynamic resolution: the last NDSR input before this frame's present (MetalFX path only), on this frame's row
     prev_in = t0; prev_pass = ps; prev_draw = dr;
     dump_frame();
     if (g_frame % TWIN == 0) tsummary(g_frame);
@@ -2043,9 +2071,10 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded
-    if (o->presents > 9) { uint64_t n = o->presents - 8; double a_ = mtl_presented_time(n), b_ = mtl_presented_time(n - 1);
+    if (o->presents > 9) { uint64_t pn = o->presents - 8, n = nvn_tk_get(&g_tk, o, pn), np = nvn_tk_get(&g_tk, o, pn - 1);   // pn: the present 8 back, n / np: its ticket and the one before (0: none)
+        double a_ = n ? mtl_presented_time(n) : 0, b_ = n && np ? mtl_presented_time(np) : 0;
         if (a_ < 0) trow(f - 8, "@presented_ms", -1); else if (a_ > 0 && b_ > 0) trow(f - 8, "@presented_ms", (a_ - b_) * 1e3);
-        g_pres_exp[g_presn % TWIN] = g_pres_exp_last = pres_expect_ms(n);
+        g_pres_exp[g_presn % TWIN] = g_pres_exp_last = pres_expect_ms(pn);
         g_pres_iv[g_presn++ % TWIN] = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0);
         { double iv_ = a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0); mtl_ub_present(iv_); }   // same-process alternating measurement (DM_NVN_UB) tallies on-screen present intervals per phase; when off it is just one atomic read
         dm_perf_present(a_ < 0 ? -1 : (a_ > 0 && b_ > 0 ? (a_ - b_) * 1e3 : 0));   // on-screen present intervals are also kept in a separate ring; tsummary reports dropped frames every 300 frames (M1 criterion)
@@ -2053,7 +2082,12 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
         // The display-link tick that took this frame: its target display time (same base as @pres_at_ms, so @pres_at_ms − @link_target_ms is how late the system showed it), the callback's lead
         // before that target, the callbacks since the previous frame's (1 = every tick took a frame) and the longest interval between them (33 ms on a 60 Hz link = a refresh the link skipped)
         double lt, ll, lg; int lk;
-        if (g_tsv && mtl_link_tick(n, &lt, &ll, &lk, &lg)) { trow(f - 8, "@link_target_ms", lt * 1e3 - g_t0_ns / 1e6); trow(f - 8, "@link_lead_ms", ll); trow(f - 8, "@link_ticks", lk); trow(f - 8, "@link_gap_ms", lg); } }
+        if (g_tsv && n && mtl_link_tick(n, &lt, &ll, &lk, &lg)) { trow(f - 8, "@link_target_ms", lt * 1e3 - g_t0_ns / 1e6); trow(f - 8, "@link_lead_ms", ll); trow(f - 8, "@link_ticks", lk); trow(f - 8, "@link_gap_ms", lg); }
+        // DM_PRESENT_VRR=at / grid (same base as @pres_at_ms): when the frame's time was set, the time it was set for, when it was handed to the screen, and its display command
+        // buffer's start and end on the GPU. @pres_at_ms − @vrr_at_ms is how late the screen showed it, @vrr_at_ms − @vrr_call_ms how early it was handed over
+        double vs, va, vc, v0, v1;
+        if (g_tsv && n && mtl_vrr_times(n, &vs, &va, &vc, &v0, &v1)) { double z = g_t0_ns / 1e6; trow(f - 8, "@vrr_set_ms", vs * 1e3 - z); trow(f - 8, "@vrr_at_ms", va * 1e3 - z); trow(f - 8, "@vrr_call_ms", vc * 1e3 - z);
+            if (v1 > 0) { trow(f - 8, "@vrr_cb0_ms", v0 * 1e3 - z); trow(f - 8, "@vrr_cb1_ms", v1 * 1e3 - z); } } }
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
 }

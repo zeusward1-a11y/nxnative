@@ -47,11 +47,14 @@ int front_display_pixels(int *w, int *h) {
 }
 static _Atomic int g_screen_variable_refresh;
 int front_screen_variable_refresh(void) { return g_screen_variable_refresh; }
+static _Atomic int64_t g_screen_step_ns;   // the screen's displayUpdateGranularity in ns (4,166,667 on an M1 Pro's ProMotion screen), 0 = not known
+double front_screen_update_step(void) { return g_screen_step_ns / 1e9; }
 static void screen_refresh(NSScreen *screen) {   // main thread: refresh capabilities of the current screen and mode, including a mode change without moving the window
     if (!screen) return;
     g_screen_fps = (int)screen.maximumFramesPerSecond;
     g_screen_id = [screen.deviceDescription[@"NSScreenNumber"] unsignedIntValue];
     g_screen_variable_refresh = screen.minimumRefreshInterval > 0 && screen.maximumRefreshInterval > screen.minimumRefreshInterval;
+    g_screen_step_ns = screen.displayUpdateGranularity > 0 ? (int64_t)(screen.displayUpdateGranularity * 1e9 + 0.5) : 0;
 }
 static _Atomic int g_fullscreen;   // the window is in fullscreen (set when it has entered and when it has left)
 // The software keyboard input box is up (front_text_input). The game window is not key then, which is not a focus change the game should see: on hardware the inline keyboard is drawn inside

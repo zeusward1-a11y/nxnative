@@ -83,17 +83,37 @@ HLE_FORCE("_ZN2nn2vi8FinalizeEv", "display service shutdown; the host has no vi 
 
 // ---------- Switch 2 SDKs: HDR, VRR and extended swap intervals ----------
 // The SDK's versions check the display against its own default display object and forward the layer to vi2, whose layer object the host never made (Donkey Kong Bananza: a call
-// through null from SetLayerNextHdrContentGamutMetadata, main+0x2036f4). The host's output is SDR at a fixed refresh rate: no HDR output, no VRR, and the layer metadata has
+// through null from SetLayerNextHdrContentGamutMetadata, main+0x2036f4). By default the host's output is SDR at a fixed refresh rate: no HDR output, no VRR, and the layer metadata has
 // nothing to apply to. HdrOutputFormat 0 is SDR; paper white is the BT.2408 reference, 203 nits, read only when HDR is on
-HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", "display HDR status: SDR output (the host presents SDR)", Result, h_vi_HdrStatus,
+// DM_VI_HDR=<format> answers HDR on with that HdrOutputFormat and a peak of DM_VI_HDR_PEAK nits (default 1000, what the Mac's XDR screens hold full screen; 1600 their peak). Donkey Kong Bananza, given format 1,
+// remakes its swap chain as RGB10A2 (BT.2100 PQ, BT.2020 gamut, content up to 1000 nits by its metadata), which the present shows on an EDR layer (nvn_mtl.m present_hdr_layer).
+// DM_VI_VRR=1 answers VRR supported: the game then sets an extended swap interval a / b (1 / 40 to 1 / 60 seconds, its own frame-rate controller's target), which the acquire
+// paces to (hle_nvn.c, dm_vi_vrr_period_ns) in place of NVN's swap interval, while the game holds the display's VRR capability on. Without it the game's controller, finding the
+// host still at 30 fps, gives up after a few tries and stays at swap interval 2
+static int vi_env(const char *name) { const char *e = getenv(name); return e && *e ? atoi(e) : -1; }
+static int vi_hdr_fmt(void) { static _Atomic int v = -2; if (v == -2) v = vi_env("DM_VI_HDR"); return v; }
+static int vi_vrr(void) { static _Atomic int v = -2; if (v == -2) v = vi_env("DM_VI_VRR") > 0; return v; }
+static int vi_hdr_peak(void) { static _Atomic int v = -2; if (v == -2) { int e = vi_env("DM_VI_HDR_PEAK"); v = e >= 100 && e <= 10000 ? e : 1000; } return v; }   // the screen's peak in nits: 1600 on a MacBook Pro's XDR screen
+static _Atomic int g_vi_hdr_asked, g_vi_vrr_cap, g_vi_hdr_max_nits;
+static _Atomic uint64_t g_vi_ext;   // the extended swap interval: a in the low half, b in the high half, 0 = none
+int dm_vi_hdr_on(void) { return vi_hdr_fmt() > 0 && g_vi_hdr_asked; }
+int dm_vi_hdr_max_nits(void) { int n = g_vi_hdr_max_nits; return n > 0 ? n : 1000; }
+uint64_t dm_vi_vrr_period_ns(void) {
+    if (!vi_vrr() || !g_vi_vrr_cap) return 0;
+    uint64_t v = g_vi_ext; uint32_t a = (uint32_t)v, b = (uint32_t)(v >> 32);
+    return a && b && a <= b ? 1000000000ull * a / b : 0;   // up to one second: a longer interval is no VRR rate
+}
+HLE_FORCE("_ZN2nn2vi21QueryDisplayHdrStatusEPbPNS0_15HdrOutputFormatEPtPKNS0_7DisplayE", "display HDR status: SDR output, or with DM_VI_HDR the format it names", Result, h_vi_HdrStatus,
           uint8_t *on, uint32_t *fmt, uint16_t *peak, const void *disp) {
-    (void)disp; if (on) *on = 0; if (fmt) *fmt = 0; if (peak) *peak = 0; return RES_OK; }
-HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "display HDR paper white: 203 nits (BT.2408); HDR is off", Result, h_vi_PaperWhite, uint16_t *nits, const void *disp) {
-    (void)disp; if (nits) *nits = 203; return RES_OK; }
-HLE_FORCE("_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE", "display VRR: not supported (fixed refresh rate)", Result, h_vi_VrrSupported, uint8_t *on, const void *disp) {
-    (void)disp; if (on) *on = 0; return RES_OK; }
-HLE_FORCE("_ZN2nn2vi23SetDisplayVrrCapabilityEPNS0_7DisplayEb", "display VRR capability: the host has no VRR", Result, h_vi_SetVrr, void *disp, unsigned on) {
-    (void)disp; (void)on; return RES_OK; }
+    (void)disp; int f = vi_hdr_fmt();
+    if (f > 0 && !atomic_exchange(&g_vi_hdr_asked, 1)) LOG("vi::QueryDisplayHdrStatus: HDR on, format %d, peak %d nits (DM_VI_HDR, DM_VI_HDR_PEAK)", f, vi_hdr_peak());
+    if (on) *on = f > 0; if (fmt) *fmt = f > 0 ? (uint32_t)f : 0; if (peak) *peak = f > 0 ? (uint16_t)vi_hdr_peak() : 0; return RES_OK; }
+// Paper white: the BT.2408 reference, 203 nits, unless DM_VI_HDR_PAPER names another (the brightness of the game's diffuse white and its UI under HDR)
+static int vi_hdr_paper(void) { static _Atomic int v = -2; if (v == -2) { int e = vi_env("DM_VI_HDR_PAPER"); v = e >= 80 && e <= 1000 ? e : 203; } return v; }
+int dm_vi_hdr_paper_nits(void) { return vi_hdr_paper(); }   // nvn_mtl.m: DM_VI_HDR_LAYER=f16 and xr show the paper white the game was told as the layer's 1.0
+HLE_FORCE("_ZN2nn2vi25QueryDisplayHdrPaperWhiteEPtPKNS0_7DisplayE", "display HDR paper white: 203 nits (BT.2408), or DM_VI_HDR_PAPER", Result, h_vi_PaperWhite, uint16_t *nits, const void *disp) {
+    (void)disp; static atomic_int once; if (vi_hdr_fmt() > 0 && !atomic_exchange(&once, 1)) LOG("vi::QueryDisplayHdrPaperWhite: %d nits", vi_hdr_paper());
+    if (nits) *nits = (uint16_t)vi_hdr_paper(); return RES_OK; }
 // The largest display buffer (vi2 through the SDK, sdk+0x5e10c0, which the host does not serve: Result 0x272 and the output left as the game set it). BufferMaxResolution is
 // 0 1280x720, 1 1920x1080, 2 2560x1440, 3 3840x2160 (Fire Emblem Fortune's Weave's own table, main+0x1abc2c0 / +0x1abc050). Fire Emblem Fortune's Weave sets 0 first, so the failed call
 // told it 720p: it chose its 1280x720 DLSS network and rendered at 640x360, and the host scaled that to the window. Answered as a Switch 2 would: in handheld mode its own 1920x1080
@@ -110,16 +130,33 @@ HLE_FORCE("_ZN2nn2vi31QueryDisplayBufferMaxResolutionEPNS0_19BufferMaxResolution
     static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("vi::QueryDisplayBufferMaxResolution: %dx%d (%s, display %dx%d)", k[r][0], k[r][1], dm_opmode() == 1 ? "docked" : "handheld", w, h);
     if (out) *out = r; return RES_OK;
 }
-// The extended swap interval asks for a presentation rate between whole vsync intervals (VRR); without VRR the swap interval NVN sets stays in effect
-HLE_FORCE("_ZN2nn2vi28SetLayerExtendedSwapIntervalEPNS0_5LayerEii", "layer extended swap interval: needs VRR, which the host has not; NVN's swap interval stays", Result, h_vi_ExtSwap,
+HLE_FORCE("_ZN2nn2vi24QueryDisplayVrrSupportedEPbPKNS0_7DisplayE", "display VRR: supported with DM_VI_VRR, otherwise a fixed refresh rate", Result, h_vi_VrrSupported, uint8_t *on, const void *disp) {
+    (void)disp; if (on) *on = vi_vrr(); return RES_OK; }
+HLE_FORCE("_ZN2nn2vi23SetDisplayVrrCapabilityEPNS0_7DisplayEb", "display VRR capability: the extended swap interval is followed while it is on (DM_VI_VRR)", Result, h_vi_SetVrr, void *disp, unsigned on) {
+    (void)disp; on &= 1;
+    if (atomic_exchange(&g_vi_vrr_cap, (int)on) != (int)on && vi_vrr()) { static atomic_int n; if (atomic_fetch_add(&n, 1) < 50) LOG("vi::SetDisplayVrrCapability %u", on); }
+    return RES_OK; }
+// The extended swap interval asks for a presentation rate between whole vsync intervals (VRR): followed with DM_VI_VRR, otherwise the swap interval NVN sets stays in effect
+HLE_FORCE("_ZN2nn2vi28SetLayerExtendedSwapIntervalEPNS0_5LayerEii", "layer extended swap interval: the frame period with DM_VI_VRR, otherwise NVN's swap interval stays", Result, h_vi_ExtSwap,
           void *layer, int a, int b) {
-    (void)layer; static atomic_int once; if (!atomic_exchange(&once, 1)) LOG("vi::SetLayerExtendedSwapInterval %d %d: no VRR on the host, the NVN swap interval stays", a, b); return RES_OK; }
-HLE_FORCE("_ZN2nn2vi30ClearLayerExtendedSwapIntervalEPNS0_5LayerE", "layer extended swap interval cleared", Result, h_vi_ExtSwapClear, void *layer) { (void)layer; return RES_OK; }
+    (void)layer;
+    uint64_t v = a > 0 && b > 0 ? (uint32_t)a | (uint64_t)(uint32_t)b << 32 : 0;
+    // Logged once, or with DM_VI_VRR each time the pair changes (up to 200 lines)
+    static atomic_int n;
+    if (atomic_exchange(&g_vi_ext, v) != v && atomic_fetch_add(&n, 1) < (vi_vrr() ? 200 : 1))
+        LOG("vi::SetLayerExtendedSwapInterval %d %d%s", a, b, vi_vrr() ? (g_vi_vrr_cap ? ": the frame period" : ": kept for when the game turns VRR on") : ": no VRR on the host, the NVN swap interval stays");
+    return RES_OK; }
+HLE_FORCE("_ZN2nn2vi30ClearLayerExtendedSwapIntervalEPNS0_5LayerE", "layer extended swap interval cleared: NVN's swap interval again", Result, h_vi_ExtSwapClear, void *layer) {
+    (void)layer; static atomic_int n; if (atomic_exchange(&g_vi_ext, 0) && vi_vrr() && atomic_fetch_add(&n, 1) < 50) LOG("vi::ClearLayerExtendedSwapInterval"); return RES_OK; }
 HLE_FORCE("_ZN2nn2vi35SetLayerNextHdrContentGamutMetadataEPNS0_5LayerENS0_15HdrContentGamutE", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrGamut, void *layer, int g) {
-    (void)layer; (void)g; return RES_OK; }
+    (void)layer; (void)g; if (vi_hdr_fmt() > 0) { static atomic_int n; if (atomic_fetch_add(&n, 1) < 20) LOG("vi HDR metadata: gamut %d", g); } return RES_OK; }
 HLE_FORCE("_ZN2nn2vi39SetLayerNextHdrToSdrToneMappingMetadataEPNS0_5LayerENS0_14HdrToneMappingE", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrToneMap, void *layer, int m) {
-    (void)layer; (void)m; return RES_OK; }
+    (void)layer; (void)m; if (vi_hdr_fmt() > 0) { static atomic_int n; if (atomic_fetch_add(&n, 1) < 20) LOG("vi HDR metadata: tone mapping %d", m); } return RES_OK; }
 HLE_FORCE("_ZN2nn2vi52SetLayerNextHdrExtendedContentLuminanceRangeMetadataEPNS0_5LayerEtt", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrExtLum,
-          void *layer, uint32_t lo, uint32_t hi) { (void)layer; (void)lo; (void)hi; return RES_OK; }
+          void *layer, uint32_t lo, uint32_t hi) {
+    (void)layer; if (vi_hdr_fmt() > 0) { g_vi_hdr_max_nits = (int)(hi & 0xffff); static atomic_int n; if (atomic_fetch_add(&n, 1) < 20) LOG("vi HDR metadata: extended luminance %u..%u", lo & 0xffff, hi & 0xffff); }
+    return RES_OK; }
 HLE_FORCE("_ZN2nn2vi52SetLayerNextHdrStandardContentLuminanceRangeMetadataEPNS0_5LayerEtt", "layer HDR metadata: SDR output, nothing to apply", Result, h_vi_HdrStdLum,
-          void *layer, uint32_t lo, uint32_t hi) { (void)layer; (void)lo; (void)hi; return RES_OK; }
+          void *layer, uint32_t lo, uint32_t hi) {
+    (void)layer; if (vi_hdr_fmt() > 0) { static atomic_int n; if (atomic_fetch_add(&n, 1) < 20) LOG("vi HDR metadata: standard luminance %u..%u", lo & 0xffff, hi & 0xffff); }
+    return RES_OK; }

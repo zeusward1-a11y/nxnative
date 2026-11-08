@@ -81,11 +81,13 @@ static void pacing_case(void) {
     }
     CHECK("present does not wait for the stalled display", longest < 50);
     CHECK("full ring uses the original texture ticket", win.ticket[indices[2]] != 0 && win.ticket[indices[3]] != 0);
+    CHECK("a queued present keeps the ticket mtl_present returned for its screen rows (nvn_tk_put)", nvn_tk_get(&g_tk, &win, win.presents) == win.ticket[indices[3]]);
     uint64_t start = now_ns(); int idx; h_nvnWindowAcquireTexture((NVNwindow *)&win, NULL, &idx);
     double ms = (now_ns() - start) / 1e6; printf("acquire: %.3f ms\n", ms);
     CHECK("acquire waits for snapshot capacity", ms >= 50);
     h_nvnQueuePresentTexture(NULL, (NVNwindow *)&win, idx);
     CHECK("snapshot resumes after acquire frees capacity", win.ticket[idx] == 0);
+    CHECK("a snapshot keeps the ticket it took though mtl_present returned 0 (its screen rows are read by it)", mtl_present_queued() != 0 && nvn_tk_get(&g_tk, &win, win.presents) == mtl_present_queued());
     mtl_present_flush(); mtl_present_test_stall(0);
     for (int i = 0; i < 4; i++) {
         h_nvnWindowAcquireTexture((NVNwindow *)&win, NULL, &idx);

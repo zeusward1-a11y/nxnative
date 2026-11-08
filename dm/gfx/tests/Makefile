@@ -31,7 +31,7 @@ MTL_T_SRC=../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_s
 # runs several ways. A new test needs its source and its build rule; no list to add it to. NOT_RUN: helpers linked into other tests (t_host_stubs, t_present_rescue_focus),
 # a fixture test_image_atomic_bounds.py builds itself (t_atomic_return), t_geometry_primitive_id (the GPU half of test_dmsh_geometry.py, which gives it the directory of
 # its translated fixtures), and t_gpuprof, which CI's CPU subset runs (.github/workflows/tests.yml)
-NOT_RUN = t_host_stubs t_present_rescue_focus t_atomic_return t_geometry_primitive_id t_gpuprof
+NOT_RUN = t_host_stubs t_present_rescue_focus t_present_hdr_hooks t_atomic_return t_geometry_primitive_id t_gpuprof
 RUN_TESTS = $(filter-out $(NOT_RUN),$(basename $(sort $(wildcard t_*.c t_*.m))))
 check_t_%: t_%
 	$(RUN_ENV) ./$<
@@ -161,6 +161,10 @@ check_t_readback: t_readback
 	DM_NVN_FAST_WAKE=0 MTL_DEBUG_LAYER=1 ./t_readback
 t_present_crop: t_present_crop.m ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_present_crop.m ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
+t_hdr_layer: t_hdr_layer.c ../nvn/nvn_hdr_layer.h
+	clang -O1 -Wall -Wextra -o $@ t_hdr_layer.c -lm
+t_present_hdr: t_present_hdr.m t_present_hdr_hooks.c ../nvn/hle_nvn.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_present_hdr.m t_present_hdr_hooks.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(filter-out ../nvn/nvn_mtl.m,$(GFX)) $(FW)
 t_present_rescue: t_present_rescue.m t_present_rescue_focus.c $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_present_rescue.m t_present_rescue_focus.c $(MTL_T_SRC) $(FW)
 .PHONY: check_t_present_rescue
@@ -183,6 +187,12 @@ check_t_present_snap: t_present_snap
 	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_present_snap resize
 t_reorder_chain: t_reorder_chain.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_reorder_chain.m $(MTL_T_SRC) $(FW)
+t_ndsr: t_ndsr.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_ndsr.m $(MTL_T_SRC) $(FW)
+.PHONY: check_t_ndsr
+check_t_ndsr: t_ndsr
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_ndsr
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_ndsr
 check_t_reorder_chain: RUN_ENV = MTL_DEBUG_LAYER=1
 t_defer_chain: t_defer_chain.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_defer_chain.m $(MTL_T_SRC) $(FW)
@@ -208,6 +218,12 @@ t_feedback: t_feedback.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_feedback.m $(MTL_T_SRC) $(FW)
 t_rast_discard: t_rast_discard.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rast_discard.m $(MTL_T_SRC) $(FW)
+t_rec_mfx: t_rec_mfx.m $(MTL_T_DEP)
+	clang $(CFLAGS) -fobjc-arc -o $@ t_rec_mfx.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
+.PHONY: check_t_rec_mfx
+check_t_rec_mfx: t_rec_mfx
+	DM_NVN_ENC_THREAD=1 MTL_DEBUG_LAYER=1 ./t_rec_mfx
+	DM_NVN_ENC_THREAD=0 MTL_DEBUG_LAYER=1 ./t_rec_mfx
 t_queue_origin: t_queue_origin.m $(MTL_T_DEP)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_queue_origin.m $(filter-out ../nvn/hle_nvn.c,$(MTL_T_SRC)) $(FW)
 .PHONY: check_t_queue_origin

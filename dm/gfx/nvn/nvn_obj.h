@@ -62,7 +62,7 @@ typedef struct { uint32_t magic; volatile uint32_t *val; } ev_t;                
 typedef struct { NVNdevice *dev; void *native; int32_t ntex, interval; NVNtexture *tex[4]; } win_builder_t;
 FITS(win_builder_t, NVNwindowBuilder);
 // avail[i]: time at which swapchain image i can be acquired again (ns, monotonic clock) = its display time + one present period; pace: target time of this window's present pacer
-typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4]; } win_t;   // ticket[i]: ticket of the most recent present of image i
+typedef struct { uint32_t magic; void *native; int32_t ntex, interval, next, crop[4]; NVNtexture *tex[4]; uint64_t presents, avail[4], pace, ticket[4], pfence[4]; } win_t;   // ticket[i]: ticket of the most recent present of image i; pfence[i]: the fence committed by then (DM_NVN_ACQ_SYNC)
 FITS(win_t, NVNwindow);
 
 // Command buffer: commands are written into the command memory given by the game (AddCommandMemory), handle = segment start address; when it runs out, the game is called back for more memory
@@ -225,6 +225,7 @@ uint64_t mtl_drawable_ns_take(void);   // Take and zero: cumulative ns spent wai
 void mtl_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes);   // Cumulative attachment load / store bytes, cumulative number of full load-store passes
 uint64_t mtl_udc_saved_bytes(void);                                      // Write-back bytes actually saved by DM_NVN_UNWRITTEN_DC
 int mtl_has_window(void);
+int mtl_acq_sync_present(void);                            // DM_NVN_ACQ_SYNC=present: an acquire sync waits for the image's last present, not for all work so far
 int mtl_fps_target(void);                                   // target frame rate 30 / 60 (power-saving mode, DM_FPS, the game itself asking for 30)
 int mtl_warm_wait(int timeout_ms);
 int mtl_link_active(void);
@@ -232,7 +233,9 @@ int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // vsyncs = the game'
 int mtl_link_wait_ticks(int ticks, uint64_t timeout_ns);   // the same in the display link's own ticks
 int mtl_link_rate(void);   // the display link's rate: 120, 60 or 30 Hz
 double mtl_presented_time(uint64_t n);
+uint64_t mtl_present_queued(void);   // the ticket the calling thread's last present took (0: it queued nothing), a snapshot's too, which mtl_present returns as 0
 int mtl_link_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms);   // the display-link tick that took the n-th present (0 = none: no display link, or not taken yet)
+int mtl_vrr_times(uint64_t n, double *set, double *at, double *call, double *cb0, double *cb1);   // DM_PRESENT_VRR=at / grid: the n-th present's set, target and hand-over times and its display command buffer on the GPU (s; 0 = none)
 int mtl_link_stalled(void);   // the display link is silent (background, occluded window, a stall) and queued frames are dropped instead of shown
 int mtl_snap_on(void); uint64_t mtl_snap_acquire_wait(void);   // present snapshots (DM_PRESENT_SNAP): on, and acquire's wait for ring capacity (returns ns spent pacing)
    // Actual presentation time (seconds) of the n-th present (counted from 1); 0 = not ready, −1 = dropped

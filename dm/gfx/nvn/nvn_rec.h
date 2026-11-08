@@ -69,6 +69,7 @@ enum {
     RO_T_ADDR, RO_T_TEX, RO_T_SAMP,
     RO_LABEL, RO_R_TS, RO_C_TS,   // diagnostics: DM_NVN_ENC_LABEL, DM_NVN_GPUPROF
     RO_NOTE,   // a[0] an _Atomic uint64_t, a[1] a value: the encode thread has made every call before this one (rec_note_wait)
+    RO_BLOCK,  // a[0] a block called with the real command buffer, no encoder open (rec_cb_do: MetalFX's scalers encode themselves)
 };
 typedef struct { uint32_t op, nobj; uint64_t a[15]; } rec_t;   // the first nobj slots hold retained objects (0 for nil), released once the call is made
 enum { REC_BLK = 256 };
@@ -173,6 +174,7 @@ static void rec_exec(const rec_t *r) {
     case RO_LABEL: [(id<MTL4CommandEncoder>)e setLabel:rec_id(a[0])]; break;
     case RO_R_TS: [(id<MTL4RenderCommandEncoder>)e writeTimestampWithGranularity:a[1] afterStage:a[2] intoHeap:rec_id(a[0]) atIndex:a[3]]; break;
     case RO_C_TS: [(id<MTL4ComputeCommandEncoder>)e writeTimestampWithGranularity:a[1] intoHeap:rec_id(a[0]) atIndex:a[2]]; break;
+    case RO_BLOCK: ((void (^)(id<MTL4CommandBuffer>))rec_id(a[0]))(g_rx_cb); break;
     case RO_NOTE: { _Atomic uint64_t *p = (_Atomic uint64_t *)(uintptr_t)a[0]; pthread_mutex_lock(&g_note_mu); if (a[1] > atomic_load(p)) atomic_store(p, a[1]); pthread_cond_broadcast(&g_note_cv); pthread_mutex_unlock(&g_note_mu); break; }
     default: MDIE("deferred encoding: unknown record %u", r->op);
     }
@@ -330,6 +332,13 @@ static inline id rec_table_real(id t) { return [t isKindOfClass:[DmRecTable clas
 @end
 
 // The replay's entry points
+// Work that encodes itself into a command buffer (MetalFX's scalers: they ask it for -useResidencySet: and their own encoders, which the stand-ins do not have; Donkey Kong Bananza's
+// NDSR stopped the host at its first frame with the encode thread): on the encode thread, in its place in the stream. Whatever the block sets on a shared object (a scaler's textures)
+// is set there too, so the submit thread can go on to the next frame
+static void rec_cb_do(id cb, void (^b)(id<MTL4CommandBuffer>)) {
+    if ([cb isKindOfClass:[DmRecCB class]]) { rec_put(RO_BLOCK, 1)->a[0] = rec_obj([b copy]); return; }
+    b(cb);
+}
 static id rec_cb_new(void) { if (!rec_on()) return [g_dev newCommandBuffer]; rec_put(RO_CB_NEW, 0); return [DmRecCB new]; }
 // Work a framework encodes itself (MetalFX's scalers) needs the real command buffer: on the encoding thread, in order with the recorded encoders
 static void rec_cb_block(id cb, void (^block)(id<MTL4CommandBuffer>)) {
